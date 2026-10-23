@@ -1,0 +1,253 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- Helpers ----------
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    // Largest image / file we store inside a Firestore document (about 675 KB of real file size).
+    // Keep the UI limits in sync with this value.
+    function maxBlob() {
+      return 900000;
+    }
+
+    function myRole() {
+      return get(/databases/(default)/documents/users/$(request.auth.uid)).data.role;
+    }
+
+    function isAdmin() {
+      return signedIn() && myRole() == 'admin';
+    }
+
+    function isStaff() {
+      return signedIn() && myRole() in ['teacher', 'admin'];
+    }
+
+    // Optional blob field check: if the field is present it must be a string under the limit
+    function blobOk(field) {
+      return !(field in request.resource.data.keys())
+        || (request.resource.data[field] is string && request.resource.data[field].size() < maxBlob());
+    }
+
+    // ---------- Users ----------
+    match /users/{uid} {
+      allow read: if signedIn();
+
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.role == 'student'
+        && request.resource.data.status == 'Active';
+
+      allow update: if signedIn() && (
+        (request.auth.uid == uid
+          && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role', 'status'])
+          && blobOk('cover'))
+        || isAdmin()
+      );
+      allow delete: if false;
+
+      match /notifications/{nid} {
+        allow read, update, delete: if signedIn() && request.auth.uid == uid;
+        allow create: if signedIn() && request.resource.data.from == request.auth.uid
+          && request.resource.data.text is string
+          && request.resource.data.text.size() < 300;
+      }
+
+      // People I follow: only I can change my own list
+      match /following/{fid} {
+        allow read: if signedIn();
+        allow create, delete: if signedIn() && request.auth.uid == uid;
+      }
+
+      // People who follow me: each follower adds or removes only their own entry
+      match /followers/{fid} {
+        allow read: if signedIn();
+        allow create: if signedIn() && request.auth.uid == fid;
+        allow delete: if signedIn() && (request.auth.uid == fid || request.auth.uid == uid);
+      }
+
+      // Unread message counter. Senders add to it, the owner resets it.
+      // The count must stay a small whole number.
+      match /unreadChats/{cid} {
+        allow read: if signedIn() && request.auth.uid == uid;
+        allow create, update: if signedIn()
+          && request.resource.data.keys().hasOnly(['count'])
+          && request.resource.data.count is int
+          && request.resource.data.count >= 0
+          && request.resource.data.count <= 500;
+        allow delete: if false;
+      }
+    }
+
+    // ---------- Presence (online status) ----------
+    match /presence/{uid} {
+      allow read: if signedIn();
+      allow create, update: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['at'])
+        && request.resource.data.at == request.time;
+      allow delete: if false;
+    }
+
+    // ---------- Groups ----------
+    match /groups/{groupId} {
+      allow read: if signedIn();
+      allow create: if signedIn() && request.resource.data.ownerUid == request.auth.uid;
+      allow update: if signedIn() && (
+        resource.data.ownerUid == request.auth.uid || isAdmin() ||
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['members'])
+      );
+      allow delete: if signedIn() && (resource.data.ownerUid == request.auth.uid || isAdmin());
+
+      // A member joins or leaves by themselves; the owner or an admin can add anyone
+      match /members/{uid} {
+        allow read: if signedIn();
+        allow create: if signedIn() && (
+          request.auth.uid == uid
+          || get(/databases/$(database)/documents/groups/$(groupId)).data.ownerUid == request.auth.uid
+          || isAdmin()
+        );
+        allow delete: if signedIn() && request.auth.uid == uid;
+      }
+    }
+
+    // ---------- Posts ----------
+    match /posts/{postId} {
+      allow read: if signedIn();
+
+      allow create: if signedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.text is string
+        && request.resource.data.text.size() <= 5000
+        && blobOk('image');
+
+      // Owner may edit text (not the author); admin may edit anything
+      allow update: if signedIn() && (
+        (resource.data.uid == request.auth.uid
+          && request.resource.data.uid == request.auth.uid
+          && request.resource.data.text.size() <= 5000
+          && blobOk('image'))
+        || isAdmin()
+      );
+
+      allow delete: if signedIn() && (resource.data.uid == request.auth.uid || isAdmin());
+
+      match /comments/{commentId} {
+        allow read: if signedIn();
+        allow create: if signedIn() && request.resource.data.uid == request.auth.uid
+          && request.resource.data.text is string
+          && request.resource.data.text.size() <= 1000;
+        allow update: if signedIn() && resource.data.uid == request.auth.uid
+          && request.resource.data.uid == request.auth.uid
+          && request.resource.data.text.size() <= 1000;
+        allow delete: if signedIn() && (resource.data.uid == request.auth.uid || isAdmin());
+      }
+
+      match /reactions/{uid} {
+        allow read: if signedIn();
+        allow create, update: if signedIn() && request.auth.uid == uid
+          && request.resource.data.type in ['like', 'love', 'haha', 'wow'];
+        allow delete: if signedIn() && request.auth.uid == uid;
+      }
+    }
+
+    // ---------- Notices (teachers and admins only) ----------
+    match /notices/{nid} {
+      allow read: if signedIn();
+      allow create: if isStaff() && request.resource.data.uid == request.auth.uid;
+      allow update, delete: if isStaff();
+    }
+
+    // ---------- Events ----------
+    match /events/{eid} {
+      allow read: if signedIn();
+      allow create, delete: if isStaff();
+      allow update: if isStaff() || (signedIn() &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['interested']));
+
+      match /interests/{uid} {
+        allow read: if signedIn();
+        allow create, delete: if signedIn() && request.auth.uid == uid;
+      }
+    }
+
+    // ---------- Lost & Found ----------
+    // The photo is optional. Unapproved items are visible only to their owner and admins.
+    match /lost/{lid} {
+      allow read: if signedIn() && (
+        resource.data.approved == true
+        || resource.data.uid == request.auth.uid
+        || isAdmin()
+      );
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid
+        && (request.resource.data.approved == false || isAdmin())
+        && blobOk('image');
+      allow update: if isAdmin();
+      allow delete: if signedIn() && (resource.data.uid == request.auth.uid || isAdmin());
+    }
+
+    // ---------- Resources (notes) ----------
+    match /resources/{rid} {
+      allow read: if signedIn();
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid
+        && (!('file' in request.resource.data.keys()) || request.resource.data.file.size() < maxBlob())
+        && (request.resource.data.link == '' || request.resource.data.link.matches('^https://.*'));
+      allow update, delete: if signedIn() && (resource.data.uid == request.auth.uid || isAdmin());
+    }
+
+    // ---------- Reports ----------
+    match /reports/{rid} {
+      allow create: if signedIn() && request.resource.data.by == request.auth.uid
+        && request.resource.data.reason.size() < 300;
+      allow read, update, delete: if isAdmin();
+    }
+
+    // ---------- Chats (one-to-one) ----------
+    // Chat summary: members, last message and time, used by the chat list
+    match /chats/{chatId} {
+      allow read: if signedIn() && request.auth.uid in resource.data.members;
+
+      allow create: if signedIn()
+        && request.auth.uid in chatId.split('_')
+        && request.resource.data.members.size() == 2
+        && request.auth.uid in request.resource.data.members
+        && request.resource.data.lastFrom == request.auth.uid
+        && request.resource.data.lastAt == request.time
+        && request.resource.data.lastText.size() <= 120
+        && request.resource.data.keys().hasOnly(['members', 'lastText', 'lastFrom', 'lastAt']);
+
+      allow update: if signedIn()
+        && request.auth.uid in resource.data.members
+        && request.resource.data.members == resource.data.members
+        && request.resource.data.lastFrom == request.auth.uid
+        && request.resource.data.lastAt == request.time
+        && request.resource.data.lastText.size() <= 120
+        && request.resource.data.keys().hasOnly(['members', 'lastText', 'lastFrom', 'lastAt']);
+
+      allow delete: if false;
+    }
+
+    // Messages: text and/or one attachment (image or file, stored as a data URL)
+    match /chats/{chatId}/messages/{mid} {
+      allow read: if signedIn() && request.auth.uid in chatId.split('_');
+      allow create: if signedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.to in chatId.split('_')
+        && request.resource.data.to != request.auth.uid
+        && request.resource.data.text is string
+        && request.resource.data.text.size() <= 1000
+        && (request.resource.data.text.size() > 0 || request.resource.data.keys().hasAny(['image', 'file']))
+        && request.resource.data.keys().hasOnly(['uid', 'to', 'text', 'createdAt', 'image', 'file', 'fileName'])
+        && blobOk('image')
+        && blobOk('file')
+        && (!('fileName' in request.resource.data.keys()) || (request.resource.data.fileName is string && request.resource.data.fileName.size() < 200))
+        && request.resource.data.createdAt == request.time;
+      allow update, delete: if false;
+    }
+
+    // ---------- Everything else is closed ----------
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
